@@ -7,6 +7,7 @@ import com.github.vincentrussell.query.mongodb.sql.converter.holder.from.SQLComm
 import com.github.vincentrussell.query.mongodb.sql.converter.processor.HavingClauseProcessor;
 import com.github.vincentrussell.query.mongodb.sql.converter.processor.JoinProcessor;
 import com.github.vincentrussell.query.mongodb.sql.converter.processor.WhereClauseProcessor;
+import com.github.vincentrussell.query.mongodb.sql.converter.util.ObjectClassUtils;
 import com.github.vincentrussell.query.mongodb.sql.converter.util.SqlUtils;
 import com.github.vincentrussell.query.mongodb.sql.converter.visitor.ExpVisitorEraseAliasTableBaseBuilder;
 import com.github.vincentrussell.query.mongodb.sql.converter.visitor.WhereVisitorMatchAndLookupPipelineMatchBuilder;
@@ -23,10 +24,7 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonParser;
-import com.mongodb.client.AggregateIterable;
-import com.mongodb.client.FindIterable;
-import com.mongodb.client.MongoCollection;
-import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.*;
 import com.mongodb.client.result.DeleteResult;
 import com.mongodb.client.result.UpdateResult;
 import net.sf.jsqlparser.expression.Alias;
@@ -963,6 +961,89 @@ public final class QueryConverter {
         }
     }
 
+
+    public <T> T selectOne(final MongoDatabase mongoDatabase, Class<T> tClass){
+        List<T> list = selectList(mongoDatabase,tClass);
+        if(list.size()>0){
+            return list.get(0);
+        }
+        return null;
+    }
+
+    public <T> List<T> selectList(final MongoDatabase mongoDatabase, Class<T> tClass){
+        MongoDBQueryHolder mongoDBQueryHolder = getMongoQuery();
+        MongoCollection mongoCollection = mongoDatabase.getCollection(mongoDBQueryHolder.getCollection());
+        List<T> result = new ArrayList<>();
+        MongoCursor mongoCursor = null;
+        if (mongoDBQueryHolder.isDistinct()) {
+            mongoCursor = mongoCollection.distinct(
+                    getDistinctFieldName(mongoDBQueryHolder), mongoDBQueryHolder.getQuery(), String.class).cursor();
+        } else if (sqlCommandInfoHolder.isCountAll() && !isAggregate(mongoDBQueryHolder)) {
+            result.add((T)Long.valueOf(mongoCollection.countDocuments(mongoDBQueryHolder.getQuery())));
+        } else if (isAggregate(mongoDBQueryHolder)) {
+            AggregateIterable aggregate = mongoCollection.aggregate(
+                    generateAggSteps(mongoDBQueryHolder, sqlCommandInfoHolder));
+            if (aggregationAllowDiskUse != null) {
+                aggregate.allowDiskUse(aggregationAllowDiskUse);
+            }
+            if (aggregationBatchSize != null) {
+                aggregate.batchSize(aggregationBatchSize);
+            }
+            mongoCursor = aggregate.cursor();
+        } else {
+            FindIterable findIterable = mongoCollection.find(mongoDBQueryHolder.getQuery())
+                    .projection(mongoDBQueryHolder.getProjection());
+            if (mongoDBQueryHolder.getSort() != null && mongoDBQueryHolder.getSort().size() > 0) {
+                findIterable.sort(mongoDBQueryHolder.getSort());
+            }
+            if (mongoDBQueryHolder.getOffset() != -1) {
+                findIterable.skip((int) mongoDBQueryHolder.getOffset());
+            }
+            if (mongoDBQueryHolder.getLimit() != -1) {
+                findIterable.limit((int) mongoDBQueryHolder.getLimit());
+            }
+            mongoCursor = findIterable.cursor();
+        }
+        if(mongoCursor != null){
+            while (mongoCursor.hasNext()){
+                Object o = mongoCursor.next();
+                if(ObjectClassUtils.isBasicClass(o)){
+                    result.add((T)o);
+                }else {
+                    result.add(toPojo(o,tClass));
+                }
+            };
+        }
+        return result;
+    }
+
+    public Long update(final MongoDatabase mongoDatabase){
+        MongoDBQueryHolder mongoDBQueryHolder = getMongoQuery();
+        MongoCollection mongoCollection = mongoDatabase.getCollection(mongoDBQueryHolder.getCollection());
+        Document updateSet = mongoDBQueryHolder.getUpdateSet();
+        List<String> fieldsToUnset = mongoDBQueryHolder.getFieldsToUnset();
+        UpdateResult result = new EmptyUpdateResult();
+        if ((updateSet != null && !updateSet.isEmpty()) && (fieldsToUnset != null && !fieldsToUnset.isEmpty())) {
+            result = mongoCollection.updateMany(mongoDBQueryHolder.getQuery(),
+                    Arrays.asList(new Document().append("$set", updateSet),
+                            new Document().append("$unset", fieldsToUnset)));
+        } else if (updateSet != null && !updateSet.isEmpty()) {
+            result = mongoCollection.updateMany(mongoDBQueryHolder.getQuery(),
+                    new Document().append("$set", updateSet));
+        } else if (fieldsToUnset != null && !fieldsToUnset.isEmpty()) {
+            result = mongoCollection.updateMany(mongoDBQueryHolder.getQuery(),
+                    new Document().append("$unset", fieldsToUnset));
+        }
+        return result.getModifiedCount();
+    }
+
+    public Long delete(final MongoDatabase mongoDatabase){
+        MongoDBQueryHolder mongoDBQueryHolder = getMongoQuery();
+        MongoCollection mongoCollection = mongoDatabase.getCollection(mongoDBQueryHolder.getCollection());
+        DeleteResult deleteResult = mongoCollection.deleteMany(mongoDBQueryHolder.getQuery());
+        return deleteResult.getDeletedCount();
+    }
+
     //Set up start pipeline, from other steps, subqueries, ...
     private List<Document> setUpStartPipeline(final MongoDBQueryHolder mongoDBQueryHolder) {
         List<Document> documents = mongoDBQueryHolder.getPrevSteps();
@@ -1040,6 +1121,11 @@ public final class QueryConverter {
                 })), stringWriter);
         IOUtils.write("]", stringWriter);
         return stringWriter.toString();
+    }
+
+    private static <T> T toPojo(final Object document,Class<T> tClass){
+        Gson gson = new GsonBuilder().setPrettyPrinting().create();
+        return gson.fromJson(gson.toJson(document),tClass);
     }
 
 
